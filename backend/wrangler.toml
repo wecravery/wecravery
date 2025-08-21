@@ -1,0 +1,254 @@
+# wrangler.toml - Cloudflare Worker configuration
+name = "photo-marketplace-worker"
+main = "src/index.js"
+compatibility_date = "2024-08-20"
+
+[env.development]
+name = "photo-marketplace-worker-dev"
+
+[env.staging]
+name = "photo-marketplace-worker-staging"
+
+[env.production]
+name = "photo-marketplace-worker"
+
+# Environment variables (set these via `wrangler secret put`)
+# FIREBASE_PROJECT_ID
+# FIREBASE_PRIVATE_KEY
+# FIREBASE_CLIENT_EMAIL
+# STRIPE_SECRET_KEY
+# STRIPE_WEBHOOK_SECRET
+
+# R2 bucket binding
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "photo-marketplace-dev"
+preview_bucket_name = "photo-marketplace-dev"
+
+[env.staging.r2_buckets]
+binding = "R2_BUCKET"
+bucket_name = "photo-marketplace-staging"
+
+[env.production.r2_buckets]
+binding = "R2_BUCKET"
+bucket_name = "photo-marketplace-prod"
+
+---
+
+# package.json for Cloudflare Worker
+{
+  "name": "photo-marketplace-worker",
+  "version": "1.0.0",
+  "description": "Backend worker for photo marketplace",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy:dev": "wrangler deploy --env development",
+    "deploy:staging": "wrangler deploy --env staging", 
+    "deploy:prod": "wrangler deploy --env production",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
+
+---
+
+# .env.example - Copy to .env and fill in your values
+# Firebase Configuration
+REACT_APP_FIREBASE_API_KEY=your_firebase_api_key
+REACT_APP_FIREBASE_AUTH_DOMAIN=your_project.firebaseapp.com
+REACT_APP_FIREBASE_PROJECT_ID=your_project_id
+REACT_APP_FIREBASE_STORAGE_BUCKET=your_project.appspot.com
+REACT_APP_FIREBASE_MESSAGING_SENDER_ID=your_sender_id
+REACT_APP_FIREBASE_APP_ID=your_app_id
+REACT_APP_FIREBASE_DATABASE_URL=https://your_project-default-rtdb.firebaseio.com
+
+# Cloudflare Worker URL
+REACT_APP_WORKER_URL=http://localhost:8787
+
+# Stripe (for frontend)
+REACT_APP_STRIPE_PUBLISHABLE_KEY=pk_test_...
+
+---
+
+# firebase.json - Firebase hosting configuration
+{
+  "hosting": [
+    {
+      "target": "photographer-app",
+      "public": "photographer-app/build",
+      "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+      "rewrites": [
+        {
+          "source": "**",
+          "destination": "/index.html"
+        }
+      ]
+    },
+    {
+      "target": "user-app", 
+      "public": "user-app/build",
+      "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+      "rewrites": [
+        {
+          "source": "**",
+          "destination": "/index.html"
+        }
+      ]
+    },
+    {
+      "target": "admin-app",
+      "public": "admin-app/build", 
+      "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+      "rewrites": [
+        {
+          "source": "**",
+          "destination": "/index.html"
+        }
+      ]
+    }
+  ],
+  "database": {
+    "rules": "database.rules.json"
+  }
+}
+
+---
+
+# database.rules.json - Firebase Realtime Database security rules
+{
+  "rules": {
+    "users": {
+      "$uid": {
+        ".read": "$uid === auth.uid || root.child('users').child(auth.uid).child('role').val() === 'admin'",
+        ".write": "$uid === auth.uid || root.child('users').child(auth.uid).child('role').val() === 'admin'"
+      }
+    },
+    "photographers": {
+      "$uid": {
+        ".read": "auth != null",
+        ".write": "$uid === auth.uid || root.child('users').child(auth.uid).child('role').val() === 'admin'"
+      }
+    },
+    "events": {
+      "$eventId": {
+        ".read": "auth != null",
+        ".write": "data.child('photographerId').val() === auth.uid || root.child('users').child(auth.uid).child('role').val() === 'admin'"
+      }
+    },
+    "eventPhotos": {
+      "$eventId": {
+        "$photoId": {
+          ".read": "auth != null",
+          ".write": "root.child('events').child($eventId).child('photographerId').val() === auth.uid || root.child('users').child(auth.uid).child('role').val() === 'admin'"
+        }
+      }
+    },
+    "qrKeycards": {
+      "$eventId": {
+        "$token": {
+          ".read": "auth != null",
+          ".write": "root.child('events').child($eventId).child('photographerId').val() === auth.uid || root.child('users').child(auth.uid).child('role').val() === 'admin'"
+        }
+      }
+    },
+    "downloadGrants": {
+      "$uid": {
+        ".read": "$uid === auth.uid",
+        ".write": false
+      }
+    },
+    "orders": {
+      "$orderId": {
+        ".read": "data.child('userId').val() === auth.uid || root.child('users').child(auth.uid).child('role').val() === 'admin'",
+        ".write": false
+      }
+    },
+    "balances": {
+      "$photographerId": {
+        ".read": "$photographerId === auth.uid || root.child('users').child(auth.uid).child('role').val() === 'admin'",
+        ".write": false
+      }
+    }
+  }
+}
+
+---
+
+# Quick setup script - setup.sh
+#!/bin/bash
+
+echo "🚀 Setting up Photo Marketplace..."
+
+# Check if required tools are installed
+command -v node >/dev/null 2>&1 || { echo "❌ Node.js is required but not installed."; exit 1; }
+command -v npm >/dev/null 2>&1 || { echo "❌ npm is required but not installed."; exit 1; }
+
+# Install Cloudflare Wrangler globally if not present
+if ! command -v wrangler &> /dev/null; then
+    echo "📦 Installing Wrangler CLI..."
+    npm install -g wrangler
+fi
+
+# Setup backend
+echo "🔧 Setting up Cloudflare Worker..."
+cd backend
+npm install
+
+# Setup React apps
+echo "📱 Setting up frontend applications..."
+
+# Photographer app
+cd ../photographer-app
+npm install
+npm install firebase @stripe/stripe-js react-router-dom axios
+
+# User app  
+cd ../user-app
+npm install
+npm install firebase @stripe/stripe-js react-router-dom axios
+
+# Admin app
+cd ../admin-app
+npm install
+npm install firebase @stripe/stripe-js react-router-dom axios
+
+cd ..
+
+echo "✅ Setup complete!"
+echo ""
+echo "Next steps:"
+echo "1. Copy .env.example to .env in each React app and fill in your Firebase config"
+echo "2. Set up your Firebase project and enable Auth + Realtime Database"
+echo "3. Create R2 buckets in Cloudflare"
+echo "4. Set Wrangler secrets: wrangler secret put FIREBASE_PROJECT_ID"
+echo "5. Run 'npm run dev' in backend/ to start the Worker"
+echo "6. Run 'npm start' in each frontend app"
+
+---
+
+# Directory structure after setup
+photo-marketplace/
+├── backend/                 # Cloudflare Worker
+│   ├── src/
+│   │   └── index.js        # Main worker code
+│   ├── wrangler.toml       # Worker configuration
+│   └── package.json
+├── photographer-app/        # React app for photographers
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── EventCreation.jsx
+│   │   │   ├── PhotoUpload.jsx
+│   │   │   └── QRKeycardGenerator.jsx
+│   │   ├── hooks/
+│   │   │   └── useAuth.js
+│   │   └── firebase/
+│   │       └── config.js
+│   └── package.json
+├── user-app/               # React app for buyers
+└── admin-app/              # React app for admins
