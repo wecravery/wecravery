@@ -1,8 +1,5 @@
-// Cloudflare Worker - Core backend for Photo Marketplace
+// Cloudflare Worker - Wecravery Photo Marketplace Backend
 // File: backend/src/index.js
-
-import { initializeApp } from 'firebase-admin/app';
-import { getAuth } from 'firebase-admin/auth';
 
 // Router for handling different endpoints
 class Router {
@@ -55,27 +52,35 @@ class Router {
   }
 }
 
-// Authentication middleware
-async function authenticate(request, env) {
-  const authHeader = request.headers.get('Authorization');
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    throw new Error('No valid authorization token');
-  }
-
-  const idToken = authHeader.substring(7);
-  
-  // Initialize Firebase Admin (you'll need to set up service account)
-  const firebaseConfig = {
-    projectId: env.FIREBASE_PROJECT_ID,
-    // Add other Firebase admin config
-  };
-
+// Firebase Auth verification using REST API
+async function verifyFirebaseToken(idToken, env) {
   try {
-    // Verify the ID token
-    const decodedToken = await getAuth().verifyIdToken(idToken);
-    return decodedToken;
+    // Use Firebase's token verification endpoint
+    const response = await fetch(
+      `https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com`
+    );
+    
+    if (!response.ok) {
+      throw new Error('Failed to get Firebase public keys');
+    }
+
+    // For now, we'll use a simplified approach
+    // In production, you'd properly verify the JWT signature
+    const decoded = JSON.parse(atob(idToken.split('.')[1]));
+    
+    // Basic validation
+    if (!decoded.uid || !decoded.email) {
+      throw new Error('Invalid token structure');
+    }
+
+    return {
+      uid: decoded.uid,
+      email: decoded.email,
+      role: decoded.role || 'user' // You'll set this in Firebase custom claims
+    };
   } catch (error) {
-    throw new Error('Invalid authentication token');
+    console.error('Token verification failed:', error);
+    throw new Error('Authentication failed');
   }
 }
 
@@ -101,15 +106,51 @@ function corsHeaders() {
   };
 }
 
-// Event Management APIs
+// Authentication middleware
+async function authenticate(request, env) {
+  const authHeader = request.headers.get('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    throw new Error('No valid authorization token');
+  }
+
+  const idToken = authHeader.substring(7);
+  return await verifyFirebaseToken(idToken, env);
+}
+
+// Firebase RTDB helper
+async function firebaseRequest(path, method = 'GET', data = null, env) {
+  const url = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com${path}.json`;
+  
+  const options = {
+    method,
+    headers: { 'Content-Type': 'application/json' }
+  };
+  
+  if (data) {
+    options.body = JSON.stringify(data);
+  }
+  
+  const response = await fetch(url, options);
+  
+  if (!response.ok) {
+    throw new Error(`Firebase request failed: ${response.statusText}`);
+  }
+  
+  return await response.json();
+}
+
+// API Handlers
 async function createEvent(request, env) {
   try {
     const user = await authenticate(request, env);
     const eventData = await request.json();
 
-    // Validate photographer role
+    // Validate photographer role (you'll need to set this in your frontend)
     if (user.role !== 'photographer') {
-      return new Response('Unauthorized', { status: 403 });
+      return new Response('Unauthorized - photographer role required', { 
+        status: 403,
+        headers: corsHeaders()
+      });
     }
 
     const eventId = generateSecureId();
@@ -139,23 +180,23 @@ async function createEvent(request, env) {
       };
     }
 
-    // Save to Firebase RTDB via REST API
-    const firebaseUrl = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/events/${eventId}.json`;
-    const firebaseResponse = await fetch(firebaseUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(event)
-    });
+    // Save to Firebase RTDB
+    await firebaseRequest(`/events/${eventId}`, 'PUT', event, env);
 
-    if (!firebaseResponse.ok) {
-      throw new Error('Failed to save event to database');
-    }
+    // Also update photographer record
+    const photographerData = {
+      studio_name: user.email.split('@')[0] + ' Studio',
+      verified: false,
+      events_count: 1 // Should be incremented properly
+    };
+    await firebaseRequest(`/photographers/${user.uid}`, 'PUT', photographerData, env);
 
     return new Response(JSON.stringify({ eventId, ...event }), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
 
   } catch (error) {
+    console.error('Create event error:', error);
     return new Response(JSON.stringify({ error: error.message }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
@@ -163,7 +204,6 @@ async function createEvent(request, env) {
   }
 }
 
-// Upload Management APIs
 async function initUpload(request, env) {
   try {
     const user = await authenticate(request, env);
@@ -172,12 +212,12 @@ async function initUpload(request, env) {
     // Validate file
     const maxSize = 10 * 1024 * 1024; // 10MB
     if (fileSize > maxSize) {
-      throw new Error('File too large');
+      throw new Error('File too large (max 10MB)');
     }
 
     const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
     if (!allowedTypes.includes(contentType)) {
-      throw new Error('Invalid file type');
+      throw new Error('Invalid file type. Allowed: JPEG, PNG, WebP');
     }
 
     // Generate unique keys
@@ -186,8 +226,8 @@ async function initUpload(request, env) {
     const extension = fileName.split('.').pop();
     const r2Key = `events/${eventId}/originals/${timestamp}-${photoId}.${extension}`;
 
-    // Create signed upload URL for R2
-    const uploadUrl = await env.R2_BUCKET.put(r2Key, null, {
+    // Create presigned URL for R2 upload
+    const object = env.R2_BUCKET.put(r2Key, null, {
       httpMetadata: { contentType },
       customMetadata: { 
         eventId, 
@@ -196,6 +236,9 @@ async function initUpload(request, env) {
         originalFileName: fileName 
       }
     });
+
+    // For now, return a placeholder URL - you'll need to implement R2 presigned URLs
+    const uploadUrl = `https://placeholder-upload-url.com/${r2Key}`;
 
     // Create initial photo record in RTDB
     const photoData = {
@@ -209,22 +252,18 @@ async function initUpload(request, env) {
       createdAt: timestamp
     };
 
-    const firebaseUrl = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/eventPhotos/${eventId}/${photoId}.json`;
-    await fetch(firebaseUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(photoData)
-    });
+    await firebaseRequest(`/eventPhotos/${eventId}/${photoId}`, 'PUT', photoData, env);
 
     return new Response(JSON.stringify({
       photoId,
       r2Key,
-      uploadUrl: uploadUrl // This would be the signed URL from R2
+      uploadUrl
     }), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
 
   } catch (error) {
+    console.error('Upload init error:', error);
     return new Response(JSON.stringify({ error: error.message }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
@@ -232,23 +271,16 @@ async function initUpload(request, env) {
   }
 }
 
-// Process uploaded photo (trigger background job)
 async function processPhoto(request, env) {
   try {
     const user = await authenticate(request, env);
     const { eventId, photoId, r2Key } = await request.json();
 
     // Update status to processing
-    const firebaseUrl = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/eventPhotos/${eventId}/${photoId}/status.json`;
-    await fetch(firebaseUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify('processing')
-    });
-
-    // In a real implementation, you'd queue this for background processing
-    // For now, we'll just simulate the process
-    console.log(`Processing photo ${photoId} with key ${r2Key}`);
+    await firebaseRequest(`/eventPhotos/${eventId}/${photoId}`, 'PATCH', {
+      status: 'processing',
+      processingStarted: Date.now()
+    }, env);
 
     // TODO: Implement actual image processing pipeline:
     // 1. Generate thumbnails (thumb/web/hi-res variants)
@@ -256,6 +288,14 @@ async function processPhoto(request, env) {
     // 3. Extract EXIF data
     // 4. Optional AI labeling
     // 5. Update status to 'published'
+
+    // For now, just mark as published after a delay
+    setTimeout(async () => {
+      await firebaseRequest(`/eventPhotos/${eventId}/${photoId}`, 'PATCH', {
+        status: 'published',
+        publishedAt: Date.now()
+      }, env);
+    }, 2000);
 
     return new Response(JSON.stringify({ 
       success: true, 
@@ -265,6 +305,7 @@ async function processPhoto(request, env) {
     });
 
   } catch (error) {
+    console.error('Process photo error:', error);
     return new Response(JSON.stringify({ error: error.message }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
@@ -272,7 +313,6 @@ async function processPhoto(request, env) {
   }
 }
 
-// Access Control APIs
 async function verifyAccess(request, env) {
   try {
     const { eventId, accessCode, qrToken } = await request.json();
@@ -282,30 +322,21 @@ async function verifyAccess(request, env) {
 
     if (qrToken) {
       // Verify QR token
-      const firebaseUrl = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/qrKeycards/${eventId}/${qrToken}.json`;
-      const response = await fetch(firebaseUrl);
-      const keycard = await response.json();
+      const keycard = await firebaseRequest(`/qrKeycards/${eventId}/${qrToken}`, 'GET', null, env);
 
       if (keycard && keycard.state === 'issued' && keycard.expiresAt > Date.now()) {
         accessGranted = true;
         accessMethod = 'qr';
 
-        // Mark as claimed (in real implementation, you'd update this atomically)
-        const updateUrl = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/qrKeycards/${eventId}/${qrToken}.json`;
-        await fetch(updateUrl, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            state: 'claimed',
-            claimedAt: Date.now()
-          })
-        });
+        // Mark as claimed
+        await firebaseRequest(`/qrKeycards/${eventId}/${qrToken}`, 'PATCH', {
+          state: 'claimed',
+          claimedAt: Date.now()
+        }, env);
       }
     } else if (accessCode) {
       // Verify access code
-      const eventUrl = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/events/${eventId}.json`;
-      const eventResponse = await fetch(eventUrl);
-      const event = await eventResponse.json();
+      const event = await firebaseRequest(`/events/${eventId}`, 'GET', null, env);
 
       if (event && event.access && event.access.codeHash) {
         const providedHash = await hashAccessCode(accessCode);
@@ -317,7 +348,7 @@ async function verifyAccess(request, env) {
     }
 
     if (accessGranted) {
-      // Generate session token (simplified - use proper JWT in production)
+      // Generate session token
       const sessionToken = generateSecureId();
       const expiresAt = Date.now() + (24 * 60 * 60 * 1000); // 24 hours
 
@@ -340,6 +371,7 @@ async function verifyAccess(request, env) {
     }
 
   } catch (error) {
+    console.error('Access verification error:', error);
     return new Response(JSON.stringify({ error: error.message }), {
       status: 400,
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
@@ -347,51 +379,82 @@ async function verifyAccess(request, env) {
   }
 }
 
-// Download Authorization
-async function authorizeDownload(request, env, pathParams) {
+async function createQRKeycard(request, env) {
   try {
     const user = await authenticate(request, env);
-    const { photoId, size } = pathParams;
+    const { eventId, count = 1 } = await request.json();
 
-    // Verify download grant exists
-    const grantUrl = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/downloadGrants/${user.uid}/${photoId}:${size}.json`;
-    const grantResponse = await fetch(grantUrl);
-    const grant = await grantResponse.json();
-
-    if (!grant || grant.expiresAt < Date.now() || grant.downloadCount >= grant.maxDownloads) {
-      return new Response('Download not authorized', { status: 403 });
+    // Verify user owns the event
+    const event = await firebaseRequest(`/events/${eventId}`, 'GET', null, env);
+    if (!event || event.photographerId !== user.uid) {
+      return new Response('Unauthorized', { status: 403, headers: corsHeaders() });
     }
 
-    // Increment download counter atomically
-    const counterUrl = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/downloadGrants/${user.uid}/${photoId}:${size}/downloadCount.json`;
-    await fetch(counterUrl, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(grant.downloadCount + 1)
-    });
+    const keycards = [];
+    const expiresAt = Date.now() + (30 * 24 * 60 * 60 * 1000); // 30 days
 
-    // Get photo metadata to determine R2 key
-    const photoUrl = `https://${env.FIREBASE_PROJECT_ID}-default-rtdb.firebaseio.com/eventPhotos/${grant.eventId}/${photoId}.json`;
-    const photoResponse = await fetch(photoUrl);
-    const photo = await photoResponse.json();
+    for (let i = 0; i < count; i++) {
+      const token = generateSecureId();
+      const keycardData = {
+        state: 'issued',
+        claimedBy: null,
+        expiresAt: expiresAt,
+        createdAt: Date.now(),
+        eventId: eventId
+      };
 
-    if (!photo) {
-      return new Response('Photo not found', { status: 404 });
+      await firebaseRequest(`/qrKeycards/${eventId}/${token}`, 'PUT', keycardData, env);
+      keycards.push({ token, ...keycardData });
     }
 
-    // Generate signed download URL from R2
-    const r2Key = size === 'original' ? photo.r2Key : photo.variants[`${size}Key`];
-    const signedUrl = await env.R2_BUCKET.get(r2Key, {
-      range: { offset: 0, length: photo.fileSize }
-    });
-
-    return new Response(JSON.stringify({ downloadUrl: signedUrl.url }), {
+    return new Response(JSON.stringify({ 
+      success: true, 
+      keycards 
+    }), {
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
 
   } catch (error) {
+    console.error('Create QR keycard error:', error);
     return new Response(JSON.stringify({ error: error.message }), {
       status: 400,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() }
+    });
+  }
+}
+
+// Test endpoint
+async function testEndpoint(request, env) {
+  return new Response(JSON.stringify({ 
+    message: 'Wecravery backend is running!',
+    timestamp: new Date().toISOString(),
+    environment: env.ENVIRONMENT || 'development',
+    version: '1.0.0'
+  }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders() }
+  });
+}
+
+// Health check endpoint
+async function healthCheck(request, env) {
+  try {
+    // Test Firebase connection
+    const testResult = await firebaseRequest('/test', 'GET', null, env);
+    
+    return new Response(JSON.stringify({ 
+      status: 'healthy',
+      firebase: 'connected',
+      timestamp: new Date().toISOString()
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders() }
+    });
+  } catch (error) {
+    return new Response(JSON.stringify({ 
+      status: 'unhealthy',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    }), {
+      status: 500,
       headers: { 'Content-Type': 'application/json', ...corsHeaders() }
     });
   }
@@ -407,6 +470,10 @@ export default {
 
     const router = new Router();
 
+    // Health and test endpoints
+    router.register('/api/test', 'GET', testEndpoint);
+    router.register('/api/health', 'GET', healthCheck);
+
     // Event Management
     router.register('/api/events/create', 'POST', createEvent);
 
@@ -417,13 +484,17 @@ export default {
     // Access Control
     router.register('/api/access/verify', 'POST', verifyAccess);
 
-    // Downloads
-    router.register('/api/download/:photoId/:size', 'GET', authorizeDownload);
+    // QR Keycard Management
+    router.register('/api/qr/create', 'POST', createQRKeycard);
 
     try {
       return await router.route(request, env);
     } catch (error) {
-      return new Response(JSON.stringify({ error: 'Internal server error' }), {
+      console.error('Worker error:', error);
+      return new Response(JSON.stringify({ 
+        error: 'Internal server error',
+        timestamp: new Date().toISOString()
+      }), {
         status: 500,
         headers: { 'Content-Type': 'application/json', ...corsHeaders() }
       });

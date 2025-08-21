@@ -15,8 +15,15 @@
     "tail:staging": "wrangler tail --env staging",
     "tail:prod": "wrangler tail --env production",
     "secrets:list": "wrangler secret list",
+    "secrets:delete": "wrangler secret delete",
     "r2:list": "wrangler r2 bucket list",
-    "test": "echo \"No tests specified\" && exit 0"
+    "r2:create:dev": "wrangler r2 bucket create wecravery-photos-dev",
+    "r2:create:staging": "wrangler r2 bucket create wecravery-photos-staging",
+    "r2:create:prod": "wrangler r2 bucket create wecravery-photos-prod",
+    "r2:create:all": "npm run r2:create:dev && npm run r2:create:staging && npm run r2:create:prod",
+    "test": "echo \"No tests specified\" && exit 0",
+    "clean": "rm -rf node_modules package-lock.json",
+    "fresh-install": "npm run clean && npm install"
   },
   "keywords": [
     "cloudflare",
@@ -25,18 +32,20 @@
     "marketplace",
     "firebase",
     "r2",
-    "stripe"
+    "wecravery"
   ],
   "author": "Wecravery Team",
   "license": "MIT",
-  "dependencies": {
-    "firebase-admin": "^12.0.0"
-  },
+  "dependencies": {},
   "devDependencies": {
-    "wrangler": "^3.78.0",
+    "wrangler": "^4.31.0",
     "@cloudflare/workers-types": "^4.20241011.0"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wecravery/wecravery"
   }
 }
